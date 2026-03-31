@@ -1122,7 +1122,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         )
         # Prefer GPU for encoder if available; otherwise keep CPU.
         dev = next(self.parameters()).device
-        if getattr(dev, "type", None) in ("cuda", "npu"):
+        if dev.type != "cpu":
             try:
                 tok.model.to(dev)
                 tok.device = dev
