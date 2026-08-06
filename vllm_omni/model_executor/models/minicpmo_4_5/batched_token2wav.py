@@ -132,6 +132,11 @@ class BatchedToken2Wav(nn.Module):
         )
 
     def _autocast(self, device: torch.device):
+        if device.type == "npu":
+            # Ascend NPU: honor float16 the same way the CUDA path does.
+            if not self.float16:
+                return torch.amp.autocast("npu", enabled=False)
+            return torch.amp.autocast("npu", dtype=torch.float16)
         if device.type != "cuda":
             return nullcontext()
         if not self.float16:
@@ -248,9 +253,16 @@ class BatchedToken2Wav(nn.Module):
         )
         timeline = 1 - torch.cos(timeline * 0.5 * torch.pi)
         time = timeline[0].expand(batch_size)
-        mu_cfg = torch.cat((mu, torch.zeros_like(mu)), dim=0)
-        speakers_cfg = torch.cat((speakers, torch.zeros_like(speakers)), dim=0)
-        cond_cfg = torch.cat((cond, torch.zeros_like(cond)), dim=0)
+        cfg_rate = float(getattr(decoder, "inference_cfg_rate", 0.0) or 0.0)
+        use_cfg = cfg_rate > 0.0
+        if use_cfg:
+            mu_in = torch.cat((mu, torch.zeros_like(mu)), dim=0)
+            speakers_in = torch.cat((speakers, torch.zeros_like(speakers)), dim=0)
+            cond_in = torch.cat((cond, torch.zeros_like(cond)), dim=0)
+        else:
+            # cfg_rate == 0: velocity == conditional estimate; skip the
+            # unconditional branch entirely (halves estimator compute).
+            mu_in, speakers_in, cond_in = mu, speakers, cond
         next_cnn: list[torch.Tensor] = []
         next_att: list[torch.Tensor] = []
         dt = timeline[1] - timeline[0]
@@ -259,16 +271,19 @@ class BatchedToken2Wav(nn.Module):
             old_att = att_cache[step] if att_cache is not None else None
             estimate, step_cnn, step_att = self._estimator_step(
                 estimator,
-                x=torch.cat((x, x), dim=0),
-                mu=mu_cfg,
-                time=torch.cat((time, time), dim=0),
-                speakers=speakers_cfg,
-                cond=cond_cfg,
+                x=torch.cat((x, x), dim=0) if use_cfg else x,
+                mu=mu_in,
+                time=torch.cat((time, time), dim=0) if use_cfg else time,
+                speakers=speakers_in,
+                cond=cond_in,
                 cnn_cache=old_cnn,
                 att_cache=old_att,
             )
-            conditional, unconditional = estimate.split(batch_size, dim=0)
-            velocity = (1.0 + decoder.inference_cfg_rate) * conditional - decoder.inference_cfg_rate * unconditional
+            if use_cfg:
+                conditional, unconditional = estimate.split(batch_size, dim=0)
+                velocity = (1.0 + cfg_rate) * conditional - cfg_rate * unconditional
+            else:
+                velocity = estimate
             x = x + dt * velocity
             time = time + dt
             if step + 1 < self.n_timesteps:

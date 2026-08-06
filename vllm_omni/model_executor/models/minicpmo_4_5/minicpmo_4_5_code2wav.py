@@ -775,4 +775,11 @@ class MiniCPMO45Code2Wav(nn.Module):
             )
         finally:
             torch.set_default_dtype(previous_dtype)
+        cfg_override = extra.get("token2wav_cfg_rate")
+        if cfg_override is not None:
+            try:
+                token2wav.flow.decoder.inference_cfg_rate = float(cfg_override)
+                logger.info("Token2wav inference_cfg_rate overridden to %s", float(cfg_override))
+            except AttributeError:
+                logger.warning("Token2wav decoder exposes no inference_cfg_rate; ignoring override")
         self.backend = BatchedToken2Wav(token2wav)
