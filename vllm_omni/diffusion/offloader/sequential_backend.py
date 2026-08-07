@@ -76,10 +76,14 @@ class SequentialOffloadHook(ModelHook):
         if param.device.type == "cpu":
             return
 
+        # XPU's allocator doesn't respect stream dependencies in empty_cache,
+        # so non-blocking copies can race with cache eviction. Use blocking
+        # copies on XPU to avoid NULL pointer errors during DMA.
+        non_blocking = not self.use_hsdp and not current_omni_platform.is_xpu()
         self._move_params(
             module,
             torch.device("cpu"),
-            non_blocking=not self.use_hsdp,
+            non_blocking=non_blocking,
             pin_memory=self.pin_memory,
         )
         current_omni_platform.empty_cache()
@@ -141,11 +145,12 @@ def apply_sequential_offload(
         ... )
         >>> # Modules of pipeline now automatically swap between CPU and GPU
     """
-    # Register hooks on DiT modules (offload encoders when DiT runs)
-    for dit_mod in dit_modules:
+    # Register hooks on DiT modules (offload encoders AND other DiTs when a DiT runs)
+    for i, dit_mod in enumerate(dit_modules):
+        other_dits = [d for j, d in enumerate(dit_modules) if j != i]
         registry = HookRegistry.get_or_create(dit_mod)
         hook = SequentialOffloadHook(
-            offload_targets=encoder_modules,
+            offload_targets=encoder_modules + other_dits,
             device=device,
             pin_memory=pin_memory,
             use_hsdp=use_hsdp,
@@ -192,30 +197,65 @@ class ModelLevelOffloadBackend(OffloadBackend):
     def __init__(self, config: OffloadConfig, device: torch.device):
         super().__init__(config, device)
         self._offload_modules: list[nn.Module] = []  # Track modules with hooks
+        self._custom_pipeline: nn.Module | None = None
 
     def enable(self, pipeline: nn.Module) -> None:
         if self.enabled:
             logger.warning("ModelLevelOffloadBackend already enabled")
             return
 
+        # Pipelines with a nested transformer (e.g. Cosmos3's reasoner/generator
+        # pathways) own their own mutual-exclusion swaps and cannot be offloaded
+        # with the generic encoder<->DiT hooks. Delegate to the custom hook.
+        # TODO: Cosmos3 is the only implementer today, so we duck-type the
+        # enable/disable_omni_model_cpu_offload pair via getattr. Once a second
+        # pipeline needs it, formalize this as a Protocol (like
+        # SupportsComponentDiscovery) instead of getattr detection.
+        custom_enable = getattr(pipeline, "enable_omni_model_cpu_offload", None)
+        if callable(custom_enable):
+            custom_enable(
+                device=self.device,
+                pin_memory=self.config.pin_cpu_memory,
+                use_hsdp=self.config.use_hsdp,
+            )
+            self._custom_pipeline = pipeline
+            self.enabled = True
+            logger.info(
+                "Model-level offloading enabled through %s.enable_omni_model_cpu_offload",
+                pipeline.__class__.__name__,
+            )
+            return
+
         modules = ModuleDiscovery.discover(pipeline)
-        if not modules.dits:
-            logger.warning("No DiT/transformer modules found, skipping model-level offloading")
-            return
-        if not modules.encoders:
-            logger.warning("No encoder modules found, skipping model-level offloading")
-            return
 
         # Move encoders to GPU
         for enc in modules.encoders:
             enc.to(self.device)
 
-        # Move VAE to GPU if available
-        if modules.vae is not None:
+        # Move VAE(s) to GPU if available
+        for vae in modules.vaes:
             try:
-                modules.vae.to(self.device, non_blocking=True)
+                vae.to(self.device, non_blocking=True)
             except Exception as exc:
                 logger.debug("Failed to move VAE to GPU: %s", exc)
+
+        # Pin resident modules on GPU (small hot submodules called inside the DiT loop).
+        for res, name in zip(modules.resident_modules, modules.resident_names):
+            try:
+                res.to(self.device)
+            except Exception as exc:
+                logger.warning("Failed to move resident module '%s' to GPU: %s", name, exc)
+
+        if not modules.dits:
+            logger.warning("No DiT/transformer modules found, skipping model-level offloading")
+            return
+
+        if not modules.encoders:
+            # Nothing to swap against — move DiTs to GPU and skip hooks.
+            for dit in modules.dits:
+                dit.to(self.device)
+            logger.warning("No encoder modules found, skipping model-level offloading")
+            return
 
         # Apply sequential offloading hooks
         apply_sequential_offload(
@@ -232,13 +272,23 @@ class ModelLevelOffloadBackend(OffloadBackend):
         self.enabled = True
 
         logger.info(
-            "Model-level offloading enabled: %s <-> %s (mutual exclusion)",
+            "Model-level offloading enabled: %s <-> %s (mutual exclusion)%s",
             ", ".join(modules.dit_names),
             ", ".join(modules.encoder_names),
+            f"; resident on GPU: {', '.join(modules.resident_names)}" if modules.resident_names else "",
         )
 
     def disable(self) -> None:
         if not self.enabled:
+            return
+
+        if self._custom_pipeline is not None:
+            custom_disable = getattr(self._custom_pipeline, "disable_omni_model_cpu_offload", None)
+            if callable(custom_disable):
+                custom_disable()
+            self._custom_pipeline = None
+            self.enabled = False
+            logger.info("Model-level offloading disabled")
             return
 
         remove_sequential_offload(self._offload_modules)

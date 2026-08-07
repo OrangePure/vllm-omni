@@ -11,7 +11,6 @@ Same structure as test_qwen3_omni (models, stage_configs, test_params, parametri
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 import pytest
 
@@ -35,12 +34,10 @@ def get_cuda_graph_config():
             "stages": {
                 0: {
                     "max_num_seqs": 1,
-                    "gpu_memory_utilization": 0.2,
                     "enforce_eager": True,
                     "async_scheduling": False,
                 },
                 1: {
-                    "gpu_memory_utilization": 0.2,
                     "enforce_eager": True,
                     "async_scheduling": False,
                 },
@@ -64,7 +61,7 @@ def get_prompt():
 
 
 @pytest.mark.advanced_model
-@pytest.mark.omni
+@pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner", tts_server_params, indirect=True)
 def test_text_to_audio_001(omni_runner, omni_runner_handler) -> None:

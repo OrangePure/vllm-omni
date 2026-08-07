@@ -15,9 +15,14 @@ import torch
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
+from vllm_omni.diffusion.attention.backends.utils import fa  # noqa: E402
 from vllm_omni.platforms import current_omni_platform
 
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
 is_gpu = current_omni_platform.is_cuda_alike() or current_omni_platform.is_xpu()
+HAS_FLASH_ATTN = fa.HAS_FLASH_ATTN
+flash_attn_func = fa.flash_attn_func  # noqa: N813
 
 
 def create_attention_mask(batch_size: int, seq_len: int, valid_len: int, device: torch.device) -> torch.Tensor:
@@ -262,6 +267,108 @@ def test_fa_vs_sdpa():
     assert mean_diff < 0.001, f"Mean difference {mean_diff} exceeds threshold 0.001"
 
     print("✓ Case 2 PASSED: FA and SDPA outputs are very close!")
+
+
+@pytest.mark.skipif(not is_gpu, reason="FlashAttention requires CUDA or XPU")
+def test_flash_attn_func_preferred_over_varlen():
+    """Test flash_attn_func availability and basic forward call."""
+    if not HAS_FLASH_ATTN:
+        pytest.skip("No Flash Attention available")
+
+    if flash_attn_func is None:
+        pytest.skip("flash_attn_func not available, will use varlen fallback")
+
+    device = torch.device(current_omni_platform.device_type)
+    dtype = torch.bfloat16
+
+    num_heads, head_dim = 8, 64
+    fa_impl = FlashAttentionImpl(
+        num_heads=num_heads, head_size=head_dim, softmax_scale=1.0 / (head_dim**0.5), causal=False
+    )
+
+    torch.manual_seed(42)
+    q = torch.randn(1, 32, num_heads, head_dim, device=device, dtype=dtype)
+    k = q.clone()
+    v = q.clone()
+
+    attn_metadata = AttentionMetadata(attn_mask=None)
+    output = fa_impl.forward(q, k, v, attn_metadata)
+
+    assert output.shape == q.shape
+    assert not torch.isnan(output).any()
+    print("✓ flash_attn_func forward works correctly!")
+
+
+def test_piecewise_flash_attn_uses_varlen_fallback(monkeypatch):
+    calls = []
+
+    def fake_varlen_func(q, k, v, **kwargs):
+        assert q.shape[1] == 4
+        assert k.shape[1] == 2
+        assert v.shape[1] == 2
+        calls.append(kwargs)
+        return q
+
+    monkeypatch.setattr(fa, "flash_attn_func", None)
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen_func)
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+
+    impl = FlashAttentionImpl(num_heads=4, num_kv_heads=2, head_size=4, softmax_scale=0.5, causal=False)
+    query = torch.randn(1, 3, 4, 4)
+    key = torch.randn(1, 3, 2, 4)
+    value = torch.randn(1, 3, 2, 4)
+    metadata = AttentionMetadata(full_attn_spans=[[(0, 3)]])
+
+    output = impl.forward_cuda(query, key, value, metadata)
+
+    assert output.shape == query.shape
+    assert len(calls) == 1
+    assert calls[0]["max_seqlen_q"] == 3
+    assert calls[0]["max_seqlen_k"] == 3
+    assert calls[0]["causal"] is False
+    assert calls[0]["softmax_scale"] == 0.5
+
+
+def test_packed_varlen_metadata_bypasses_mask_unpadding(monkeypatch):
+    calls = []
+
+    def fake_varlen_func(q, k, v, **kwargs):
+        calls.append((q.shape, k.shape, v.shape, kwargs))
+        return q
+
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen_func)
+
+    impl = FlashAttentionImpl(num_heads=2, head_size=4, softmax_scale=0.5, causal=False)
+    query = torch.randn(1, 8, 2, 4)
+    cu_seqlens = torch.tensor([0, 6, 8], dtype=torch.int32)
+    metadata = AttentionMetadata(
+        attn_mask=torch.tensor([[True] * 6 + [False] * 2]),
+        extra={
+            "cu_seqlens_q": cu_seqlens,
+            "cu_seqlens_k": cu_seqlens,
+            "max_seqlen_q": 6,
+            "max_seqlen_k": 6,
+        },
+    )
+
+    output = impl.forward_cuda(query, query, query, metadata)
+
+    assert torch.equal(output, query)
+    assert len(calls) == 1
+    assert calls[0][0] == torch.Size([8, 2, 4])
+    assert calls[0][3]["cu_seqlens_q"] is cu_seqlens
+    assert calls[0][3]["max_seqlen_q"] == 6
+
+
+def test_packed_varlen_metadata_must_be_complete(monkeypatch):
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    impl = FlashAttentionImpl(num_heads=2, head_size=4, softmax_scale=0.5, causal=False)
+    query = torch.randn(1, 8, 2, 4)
+    metadata = AttentionMetadata(extra={"cu_seqlens_q": torch.tensor([0, 8], dtype=torch.int32)})
+
+    with pytest.raises(ValueError, match="Incomplete packed FlashAttention metadata"):
+        impl.forward_cuda(query, query, query, metadata)
 
 
 if __name__ == "__main__":

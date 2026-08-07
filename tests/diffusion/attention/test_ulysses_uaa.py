@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
@@ -20,6 +21,8 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.forward_context import get_forward_context, set_forward_context
 from vllm_omni.platforms import current_omni_platform
+
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
 def _find_free_port() -> int:
@@ -79,7 +82,7 @@ def _run_attention_case(
     )
     od_config = OmniDiffusionConfig(model="test", dtype=torch.float32, parallel_config=parallel_config)
 
-    with set_forward_context(omni_diffusion_config=od_config):
+    with set_forward_context(omni_diffusion_config=od_config), set_current_diffusion_config(od_config):
         attn = Attention(
             num_heads=num_heads,
             head_size=head_size,

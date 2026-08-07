@@ -276,7 +276,9 @@ class MiMoAudioDataParser(MultiModalDataParser):
                 self.device = torch.device(tokenizer_device)
         else:
             # Default to cuda (will use current GPU)
-            self.device = torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
+            self.device = torch.device(
+                f"cuda:{torch.accelerator.current_device_index()}" if torch.cuda.is_available() else "cpu"
+            )
 
         self.audio_tokenizer_path = os.environ.get("MIMO_AUDIO_TOKENIZER_PATH", None)
         if not self.audio_tokenizer_path:
@@ -457,13 +459,7 @@ class MiMoAudioLLMMultiModalProcessor(BaseMultiModalProcessor[MiMoAudioLLMProces
 
             num_features = audio_output_lengths[item_idx] // 4
             if num_features == 0:
-                try:
-                    audios = mm_items.get_items("audio", AudioProcessorItems)
-                    audio_len = audios.get_audio_length(item_idx)
-                    raise ValueError(f"The audio (len={audio_len}) is too short to be represented inside the model")
-                except (AttributeError, KeyError):
-                    # If AudioProcessorItems is not available, use default
-                    num_features = 1
+                num_features = 1
 
             audio_tokens = [audio_token_id] * num_features
 
@@ -797,9 +793,21 @@ class MiMoAudioForConditionalGeneration(
                 **kwargs,
             )
 
+            # next_speech_tokens is request-indexed (num_reqs, 1, 8, 4), not
+            # token-indexed, so ship it as a per-request list. The payload
+            # builder slices batched tensors by token offsets (start:end),
+            # which only coincides with the request index in pure-decode
+            # steps; in a mixed prefill+decode batch every request would
+            # receive the whole batch tensor, leaking codes across requests
+            # and crashing the downstream ragged-list conversion.
+            if next_speech_tokens is not None:
+                speech_token_payload = list(next_speech_tokens.split(1, dim=0))
+            else:
+                speech_token_payload = None
+
             return OmniOutput(
                 text_hidden_states=text_hidden_states.reshape(-1, text_hidden_states.shape[-1]),
-                multimodal_outputs={"code_predictor_codes": next_speech_tokens},
+                multimodal_outputs={"codes": {"audio": speech_token_payload}},
             )
 
         if self.model_stage == "code2wav":

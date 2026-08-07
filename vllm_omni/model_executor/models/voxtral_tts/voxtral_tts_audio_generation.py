@@ -3,7 +3,7 @@
 
 import math
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import Enum
 from functools import cached_property
 from math import ceil
@@ -57,6 +57,8 @@ from vllm.multimodal.processing.processor import (
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.tokenizers.mistral import MistralTokenizer
+
+from vllm_omni.quantization.component_config import ComponentQuantizationConfig
 
 weight_norm = torch.nn.utils.parametrizations.weight_norm
 
@@ -197,6 +199,10 @@ def from_nested_dict(cls, d):
     return cls(**kwargs)
 
 
+def _is_fp8_quant_config(quant_config) -> bool:
+    return quant_config is not None and quant_config.get_name() == "fp8"
+
+
 class FeedForward(nn.Module):
     def __init__(
         self,
@@ -240,7 +246,6 @@ class BidirectionalAttention(nn.Module):
 
         self.n_local_heads: int = args.n_heads
         self.n_local_kv_heads: int = args.n_kv_heads
-        self.repeats = self.n_local_heads
         self.layer_id = layer_id
 
         self.head_dim = args.head_dim
@@ -270,7 +275,6 @@ class BidirectionalAttention(nn.Module):
             bias=args.use_biases,
         )
 
-        self.softmax_scale: float = self.args.head_dim**-0.5
         self.repeats = self.n_local_heads // self.n_local_kv_heads
 
     def _native_attention(
@@ -414,13 +418,6 @@ class FlowMatchingAudioTransformer(nn.Module):
         self.acoustic_transformer_args = args
         assert isinstance(self.acoustic_transformer_args, AcousticTransformerArgs)
 
-        # currently assuming always 1 semantic codebook + N acoustic codebooks
-        self.num_non_acoustic_embeddings = 1
-        self.num_acoustic_codebooks = len(self.model_args.get_codebook_sizes()) - self.num_non_acoustic_embeddings
-
-        # flow matching utils
-        self.sigma = args.sigma
-
         # codebook sizes
         acoustic_codebook_sizes = self.model_args.get_codebook_sizes(
             pad_to_multiple=None, include_special_tokens=False
@@ -438,8 +435,6 @@ class FlowMatchingAudioTransformer(nn.Module):
 
         # Flow matching constants
         self._n_steps = args.n_decoding_steps
-        # TODO(chenyo): hardcoded, need to fix
-        self._cfg_alpha = 1.2
         self._noise_scale = 1.0
         self.register_buffer(
             "_timesteps",
@@ -512,6 +507,7 @@ class FlowMatchingAudioTransformer(nn.Module):
         self,
         semantic_code: torch.Tensor,
         llm_hidden: torch.Tensor,
+        cfg_alpha: torch.Tensor,
     ) -> torch.Tensor:
         B = semantic_code.shape[0]
 
@@ -524,6 +520,10 @@ class FlowMatchingAudioTransformer(nn.Module):
 
         timesteps = self._timesteps.to(dtype=llm_hidden.dtype)
         llm_hidden_zero = torch.zeros_like(llm_hidden)
+
+        # Reshape cfg_alpha for broadcasting: (B,) -> (B, 1)
+        cfg_alpha = cfg_alpha.to(dtype=llm_hidden.dtype, device=llm_hidden.device)
+        cfg_alpha = cfg_alpha.unsqueeze(1)  # (B, 1) for broadcasting with (B, C)
 
         # Euler integration with batched conditional + unconditional velocity
         sampled = x_0
@@ -544,7 +544,7 @@ class FlowMatchingAudioTransformer(nn.Module):
                 t_emb=t_emb_batched,
             )
             v_t, uncond_v_t = v_all[:B], v_all[B:]
-            v_t = self._cfg_alpha * v_t + (1 - self._cfg_alpha) * uncond_v_t
+            v_t = cfg_alpha * v_t + (1 - cfg_alpha) * uncond_v_t
 
             sampled = sampled + v_t * dt
 
@@ -585,6 +585,7 @@ class FlowMatchingAudioTransformer(nn.Module):
     def forward(
         self,
         llm_hidden: torch.Tensor,
+        cfg_alpha: torch.Tensor,
     ) -> torch.Tensor:
         # llm_hidden: BxD
         semantic_logit = self.semantic_codebook_output(llm_hidden).float()
@@ -594,10 +595,10 @@ class FlowMatchingAudioTransformer(nn.Module):
         # semantic_logit: Bx1
         semantic_code = semantic_logit.argmax(dim=-1, keepdim=True)
 
-        # acoustic codes, TODO(@chenyo): config sampling
         acoustic_codes = self.decode_one_frame(
             semantic_code.squeeze(1),
             llm_hidden,
+            cfg_alpha=cfg_alpha,
         )
 
         audio_codes = torch.concatenate(
@@ -705,7 +706,6 @@ class VoxtralTTSProcessorAdapter:
                 )
 
             text_tokens_for_audio = list[torch.Tensor]()
-            assert audios is not None
             audio_tokens_pt = list[torch.Tensor]()
             for audio_token_array in audio_tokens:
                 assert isinstance(audio_token_array, np.ndarray)
@@ -912,6 +912,28 @@ class VoxtralTTSAudioGenerationForConditionalGeneration(nn.Module, SupportsMulti
 
         config = vllm_config.model_config.hf_config
         self.config = config
+        quant_config = vllm_config.quant_config
+        if isinstance(quant_config, ComponentQuantizationConfig):
+            component_configs = dict(quant_config.component_configs)
+            component_configs[maybe_prefix(prefix, "audio_tokenizer")] = None
+            component_configs[maybe_prefix(prefix, "acoustic_transformer")] = None
+            quant_config = ComponentQuantizationConfig(
+                component_configs=component_configs,
+                default_config=None,
+            )
+            vllm_config = replace(vllm_config, quant_config=quant_config)
+        elif _is_fp8_quant_config(quant_config):
+            quant_config = ComponentQuantizationConfig(
+                component_configs={
+                    maybe_prefix(prefix, "language_model"): quant_config,
+                    maybe_prefix(prefix, "audio_tokenizer"): None,
+                    maybe_prefix(prefix, "acoustic_transformer"): None,
+                },
+                default_config=None,
+            )
+            vllm_config = replace(vllm_config, quant_config=quant_config)
+            logger.info("Voxtral TTS FP8 routing: language_model=fp8, acoustic_transformer=bf16, audio_tokenizer=bf16")
+
         self.language_model = init_vllm_registered_model(
             vllm_config=vllm_config,
             hf_config=config.text_config,
@@ -976,7 +998,7 @@ class VoxtralTTSAudioGenerationForConditionalGeneration(nn.Module, SupportsMulti
 
         if audio_arrays is not None:
             if not isinstance(audio_arrays, (torch.Tensor, list)):
-                raise ValueError(f"Incorrect type of images. Got type: {type(audio_arrays)}")
+                raise ValueError(f"Incorrect type of audio_arrays. Got type: {type(audio_arrays)}")
             if isinstance(audio_arrays, torch.Tensor) and audio_arrays.dim() == 3:
                 audio_arrays = flatten_bn(audio_arrays)
             if isinstance(audio_arrays, torch.Tensor):
@@ -1021,25 +1043,14 @@ class VoxtralTTSAudioGenerationForConditionalGeneration(nn.Module, SupportsMulti
         fake_logits[~is_eos, self.audio_tok_id] = 1.0
         return fake_logits
 
-    # TODO(chenyo): Remove this
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor | None:
-        text_logits = self.language_model.compute_logits(
-            hidden_states,
-        )
-        assert text_logits is not None
-        return text_logits
-
     def compute_mm_logits(
         self,
         hidden_states: torch.Tensor,
+        cfg_alpha: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        audio_codes = None
-        mm_tokens = None
         audio_codes = self.acoustic_transformer(
             llm_hidden=hidden_states,
+            cfg_alpha=cfg_alpha,
         )
         fake_eos = torch.where(
             audio_codes[:, 0] == AudioSpecialTokens.id(AudioSpecialTokens.end_audio),
@@ -1049,12 +1060,11 @@ class VoxtralTTSAudioGenerationForConditionalGeneration(nn.Module, SupportsMulti
         # BxC -> Bx1xC since this is per-step
         # Make it a list for vllm-omni processing
         audio_list = list(torch.split(audio_codes.unsqueeze(1), 1, dim=0))
-        mm_tokens = {"audio": audio_list}
+        mm_tokens = {"codes": {"audio": audio_list}}
 
         return fake_eos, mm_tokens
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # fmt: on
         remapping_rules = [
             (r"^acoustic_transformer\.(.*)$", r"\1"),  # noqa: E501
             (r"^audio_tokenizer\.(.*)$", r"\1"),  # noqa: E501

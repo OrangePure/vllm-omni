@@ -52,7 +52,7 @@ The diffusion module follows a **multi-process, distributed architecture** with 
 
 ### Responsibilities
 
-The `DiffusionEngine` is the **orchestrator** of the diffusion inference system. It manages the lifecycle of worker processes and coordinates the execution flow.
+The `DiffusionEngine` is the **orchestrator** of the diffusion inference system. It owns request admission, scheduler/executor coordination, output-stream delivery, cancellation cleanup, and startup warmup.
 
 ### Key Components
 
@@ -60,68 +60,84 @@ The `DiffusionEngine` is the **orchestrator** of the diffusion inference system.
 
 ```python
 class DiffusionEngine:
-    def __init__(self, od_config: OmniDiffusionConfig):
+    def __init__(
+        self,
+        od_config: OmniDiffusionConfig,
+        scheduler: SchedulerInterface | None = None,
+    ):
         self.od_config = od_config
-        self.post_process_func = get_diffusion_post_process_func(od_config)
-        self.pre_process_func = get_diffusion_pre_process_func(od_config)
-        self._processes: list[mp.Process] = []
-        self._make_client()
+        self._init_process_hooks(od_config)
+        self.execution_mode = self._resolve_execution_mode(od_config)
+        self._init_executor(od_config)
+        self._init_scheduler(od_config, scheduler)
+        self._init_runtime_state()
+        self._init_execute_fn()
 ```
 
 **Key Features**:
 
 - **Pre/Post Processing**: Registers model-specific pre-processing and post-processing functions via registry pattern
 
-- **Worker Management**: Launches and manages multiple worker processes (one per GPU)
+- **Execution Mode Selection**: Selects one of two execution modes:
+  - `REQUEST_BATCH`: complete requests are scheduled through request-level execution. `max_num_seqs=1` is the serial request path; values above `1` allow compatible requests to use fused `pipeline.forward(batch)` when the pipeline supports it.
+  - `STEP_BATCH`: requests are advanced one denoising step at a time through `prepare_encode()`, `denoise_step()`, `step_scheduler()`, and `post_decode()`. `max_num_seqs` controls the maximum number of compatible active requests in one step wave.
 
-- **Process Isolation**: Uses multiprocessing for true parallelism
+- **Scheduler Selection**: Uses `StepScheduler` for step-batch execution and `RequestScheduler` for request-batch execution. Tests and custom integrations may inject a `SchedulerInterface` instance explicitly.
 
-#### 1.2 Worker Launch Process
+- **Executor Selection**: Builds the configured `DiffusionExecutor`, then routes scheduled work through `execute_batch` or `execute_step` according to the execution mode. `execute_batch` handles the serial `max_num_seqs=1` request path internally.
 
-The engine launches workers using a **spawn** method:
+- **Factory-Owned Warmup**: `DiffusionEngine.make_engine()` constructs the selected engine backend and then runs startup warmup through `run_startup_warmup()`.
+
+#### 1.2 Execution Modes
 
 ```python
-def _launch_workers(self, broadcast_handle):
-    # Creates one process per GPU
-    for i in range(num_gpus):
-        process = mp.Process(
-            target=worker_proc.worker_main,
-            args=(i, od_config, writer, broadcast_handle),
-            name=f"DiffusionWorker-{i}",
-        )
-        process.start()
+class DiffusionExecutionMode(str, Enum):
+    REQUEST_BATCH = "request_batch"
+    STEP_BATCH = "step_batch"
+```
+
+`streaming_output=True` requires step execution. If streaming is enabled without `step_execution=True`, the engine enables step execution so the output stream can receive intermediate chunks or the final step output.
+
+#### 1.3 Output Stream Lifecycle
+
+```python
+request_id = engine.add_request(request)
+async for output in engine.get_output_stream(request_id):
+    yield output
 ```
 
 **Design Decisions**:
 
-- **Spawn Method**: Ensures clean state for each worker (no shared memory issues)
+- **Unified Stream Semantics**: `step_streaming()` is the public async engine path. Streaming callers forward every yielded output. Non-streaming callers consume the same stream to completion and return only the final output.
 
-- **Pipe Communication**: Uses `mp.Pipe` for initialization handshake
+- **Queue Delivery**: Each admitted request gets an `asyncio.Queue[DiffusionOutput]`. The busy loop emits chunks/final outputs into that queue.
 
-- **Device Selection**: Each worker is assigned a specific GPU (`cuda:{rank}`)
+- **Cancellation Cleanup**: If a client disconnects or cancels stream consumption, `get_output_stream()` removes only the queue. Scheduler terminal state is still finalized when the scheduler reports the request as finished, so request IDs do not remain active indefinitely.
 
-#### 1.3 Request Processing Flow
+#### 1.4 Request Processing Flow
 
 ```python
-def step(self, requests: list[OmniDiffusionRequest]):
+async def step_streaming(self, request: OmniDiffusionRequest):
     # 1. Pre-process requests
-    requests = self.pre_process_func(requests)
+    request = self.pre_process_func(request)
 
-    # 2. Send to scheduler and wait for response
-    output = self.add_req_and_wait_for_response(requests)
-
-    # 3. Post-process results
-    result = self.post_process_func(output.output)
-    return result
+    # 2. Add request and consume the unified output stream
+    async for output in self.async_add_req_and_stream_response(request):
+        # 3. Post-process each delivered output
+        yield self.postprocess_output(request, output, ...)
 ```
 
 **Flow**:
 
 1. **Pre-processing**: Applies model-specific transformations
 
-2. **Scheduling**: Delegates to scheduler for distribution
+2. **Scheduling**: Delegates request state transitions to the selected scheduler
 
-3. **Post-processing**: Converts raw outputs to final format (e.g., PIL images)
+3. **Execution**: Calls the selected executor function for request, request-batch, or step execution
+
+4. **Output Delivery**: Emits intermediate chunks and final outputs through the request output stream
+
+5. **Post-processing**: Converts raw outputs to final format (e.g., PIL images)
 
 ---
 
@@ -135,28 +151,7 @@ The scheduler is a **request-state scheduler**. It owns request lifecycle manage
 
 ### Key Components
 
-#### 2.1 Scheduler Interface
-
-```python
-class SchedulerInterface(ABC):
-    def add_request(self, request: OmniDiffusionRequest) -> str: ...
-    def schedule(self) -> DiffusionSchedulerOutput: ...
-    def update_from_output(
-        self,
-        sched_output: DiffusionSchedulerOutput,
-        output: DiffusionOutput,
-    ) -> set[str]: ...
-```
-
-**Responsibilities**:
-
-- **Lifecycle contract**: Defines how the engine adds requests, triggers one scheduling cycle, and feeds executor results back.
-
-- **Stable boundary**: `DiffusionSchedulerOutput` is the only scheduling result consumed by `DiffusionEngine`.
-
-- **Pluggability**: Different scheduler policies can reuse the same engine integration path.
-
-#### 2.2 Request State Model
+#### 2.1 Request State Model
 
 ```python
 class DiffusionRequestStatus(enum.IntEnum):
@@ -168,45 +163,61 @@ class DiffusionRequestStatus(enum.IntEnum):
     FINISHED_ERROR = ...
 
 @dataclass
-class DiffusionRequestState:
-    sched_req_id: str
+class SchedulerRequestState:
+    request_id: str
     req: OmniDiffusionRequest
+    sampling_params_key: StepBatchSamplingParamsKey | RequestBatchSamplingParamsKey | None = None
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
+    error: str | None = None
 ```
 
 **Design Features**:
-
-- **Scheduler-owned ID**: Each `OmniDiffusionRequest` is tracked by an internal `sched_req_id`, separated from public `request_id` values.
 
 - **Explicit lifecycle**: Requests move through waiting, running, optional preemption, and terminal states.
 
 - **Centralized error handling**: Completion, abort, and error states are all normalized in the scheduler layer.
 
-#### 2.3 Shared Bookkeeping in `_BaseScheduler`
+#### 2.2 Shared Bookkeeping in `BaseScheduler`
 
 ```python
-class _BaseScheduler(SchedulerInterface):
+class BaseScheduler:
     def __init__(self) -> None:
         self._request_states = {}
-        self._request_id_to_sched_req_id = {}
         self._waiting = deque()
         self._running = []
         self._finished_req_ids = set()
         self.max_num_running_reqs = 1
+
+    def add_request(self, request: OmniDiffusionRequest) -> str: ...
+    def schedule(self) -> DiffusionSchedulerOutput: ...
+    def update_from_output(
+        self,
+        sched_output: DiffusionSchedulerOutput,
+        output: BaseRunnerOutput,
+    ) -> set[str]: ...
 ```
+
+**Responsibilities**:
+
+- **Lifecycle contract**: Defines how the engine adds requests, triggers one scheduling cycle, and feeds executor results back.
+
+- **Stable boundary**: `DiffusionSchedulerOutput` is the only scheduling result consumed by `DiffusionEngine`.
+
+- **Pluggability**: Different scheduler policies can reuse the same engine integration path.
 
 **Design Features**:
 
 - **Common state storage**: Shared request maps and waiting/running sets live in the base class.
 
-- **Shared cleanup logic**: Request-id registration, finish handling, and state removal are centralized instead of duplicated in each policy.
+- **Shared cleanup logic**: Duplicate-request checks, finish handling, and state removal are centralized instead of
+  duplicated in each policy.
 
-- **Current constraint**: `max_num_running_reqs` remains `1` because the current engine path is still synchronous request-mode execution.
+- **Current constraint boundary**: `BaseScheduler` derives `max_num_running_reqs` from `max_num_seqs`. Request-mode diffusion can use that capacity for compatible independent requests when the configured pipeline declares `supports_request_batch = True`; step-wise diffusion uses the same scheduler capacity for compatible step batches.
 
-#### 2.4 Current `RequestScheduler` Policy
+#### 2.3 Current `RequestScheduler` Policy
 
 ```python
-class RequestScheduler(_BaseScheduler):
+class RequestScheduler(BaseScheduler):
     def schedule(self) -> DiffusionSchedulerOutput:
         # 1. keep existing RUNNING requests in the scheduling result
         # 2. pull WAITING requests while capacity remains
@@ -217,14 +228,14 @@ class RequestScheduler(_BaseScheduler):
 
 - **FIFO request scheduling**: Waiting requests are promoted in queue order.
 
-- **Single-request admission**: The current policy only admits one active request at a time.
+- **Compatible request admission**: `RequestScheduler` admits waiting requests while capacity remains and the request's `RequestBatchSamplingParamsKey` is compatible with the active batch. Request-mode execution keeps each logical request independent, while batch-capable pipelines receive the scheduled requests as a runner-side `DiffusionRequestBatch`.
 
-- **Executor result feedback**: `update_from_output()` converts executor output into `FINISHED_COMPLETED` or `FINISHED_ERROR` and returns finished scheduler ids.
+- **Executor result feedback**: `update_from_output()` converts executor output into `FINISHED_COMPLETED` or `FINISHED_ERROR` and returns finished request ids.
 
-#### 2.5 Engine-Driven Execution Loop
+#### 2.4 Engine-Driven Execution Loop
 
 ```python
-sched_req_id = scheduler.add_request(request)
+request_id = scheduler.add_request(request)
 while True:
     sched_output = scheduler.schedule()
     output = executor.add_req(req)
@@ -237,7 +248,11 @@ while True:
 
 - **No scheduler-owned IPC**: Scheduler no longer talks to workers directly.
 
-- **Conservative concurrency**: The current request-mode implementation still allows only one active request at a time.
+- **Split concurrency model**: Request-mode diffusion can schedule a static
+  batch of compatible independent requests for one full pipeline forward when
+  the pipeline supports request-level batching; the step-wise path can also
+  admit or remove compatible requests between denoise steps. See
+  [Diffusion Continuous Batching](../feature/diffusion_continuous_batching.md).
 
 ---
 
@@ -267,7 +282,7 @@ class WorkerProc:
             self.result_mq = MessageQueue(n_reader=1, ...)
 
         # Initialize GPU worker
-        self.worker = GPUWorker(local_rank=gpu_id, rank=gpu_id, od_config=od_config)
+        self.worker = self._create_worker(gpu_id, od_config, ...)
 ```
 
 **Initialization Steps**:
@@ -289,13 +304,18 @@ class WorkerProc:
 #### 3.2 GPU Worker
 
 ```python
-class GPUWorker:
-    def init_device_and_model(self):
+class DiffusionWorker:
+    def init_device(self):
         # Set distributed environment variables
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
 
-        # Initialize PyTorch distributed
+        # Select the device and initialize distributed execution
+        self.device = current_omni_platform.get_torch_device(rank)
+        current_omni_platform.set_device(self.device)
+        self.vllm_config = _create_diffusion_worker_vllm_config(
+            self.device, self.od_config
+        )
         init_distributed_environment(world_size, rank)
         parallel_config = self.od_config.parallel_config
         initialize_model_parallel(
@@ -306,16 +326,18 @@ class GPUWorker:
             pipeline_parallel_size=parallel_config.pipeline_parallel_size,
         )
 
-        # Load model
-        model_loader = DiffusersPipelineLoader(load_config)
-        self.pipeline = model_loader.load_model(od_config, load_device=f"cuda:{rank}")
+    def load_model(self, load_format="default", custom_pipeline_name=None):
+        self.model_runner.load_model(
+            load_format=load_format,
+            custom_pipeline_name=custom_pipeline_name,
+        )
 
-        # Setup cache backend
-        from vllm_omni.diffusion.cache.selector import get_cache_backend
-        self.cache_backend = get_cache_backend(od_config.cache_backend, od_config.cache_config)
-
-        if self.cache_backend is not None:
-            self.cache_backend.enable(self.pipeline)
+    def init_lora_manager(self):
+        self.lora_manager = DiffusionLoRAManager(
+            pipeline=self.model_runner.pipeline,
+            device=self.device,
+            dtype=self.od_config.dtype,
+        )
 ```
 
 **Key Features**:
@@ -329,17 +351,17 @@ class GPUWorker:
 #### 3.3 Worker Busy Loop
 
 ```python
-def worker_busy_loop(self):
+def _worker_busy_loop(self):
     while self._running:
         # 1. Receive unified message (generation request, RPC request, or shutdown)
-        msg = self.recv_message()
+        msg = self.mq.dequeue(timeout=1.0)
 
         # 2. Route message based on type
         if isinstance(msg, dict) and msg.get("type") == "rpc":
             # Handle RPC request
-            result, should_reply = self.execute_rpc(msg)
+            result, should_reply = self._execute_rpc(msg)
             if should_reply:
-                self.return_result(result)
+                self._return_result(result)
 
         elif isinstance(msg, dict) and msg.get("type") == "shutdown":
             # Handle shutdown message
@@ -348,7 +370,7 @@ def worker_busy_loop(self):
         else:
             # Handle generation request (OmniDiffusionRequest list)
             output = self.worker.execute_model(msg, self.od_config)
-            self.return_result(output)
+            self._return_result(output)
 ```
 
 **Execution Flow**:
@@ -455,7 +477,7 @@ To learn more about the diffusion pipeline and how to add a new diffusion pipeli
 
 #### Architecture
 
-The attention system uses a **backend selector pattern** that automatically chooses the optimal attention implementation based on hardware and model configuration.
+The attention system uses a **role-aware backend selector pattern**. Each `Attention` site declares a semantic `role` (`"self"`, `"cross"`, or a model-specific string). The selector consults the user's `AttentionConfig` to pick a backend per role and falls back to the platform default when nothing is configured.
 
 #### Backend Selection
 
@@ -463,91 +485,89 @@ The attention system uses a **backend selector pattern** that automatically choo
 
 ```python
 class Attention(nn.Module):
-    def __init__(self, num_heads, head_size, causal, softmax_scale, ...):
-        # Auto-select backend
-        self.attn_backend = get_attn_backend(-1)
-        self.attn_impl_cls = self.attn_backend.get_impl_cls()
-        self.attention = self.attn_impl_cls(...)
+    def __init__(self, num_heads, head_size, causal, softmax_scale, *,
+                 role="self", role_category=None, ...):
+        # Resolve backend for this role from the active OmniDiffusionConfig
+        config = get_current_diffusion_config_or_none()
+        attention_config = config.diffusion_attention_config if config is not None else None
+        attn_backend_cls, spec = get_attn_backend_for_role(
+            role=role,
+            head_size=head_size,
+            attention_config=attention_config,
+            role_category=role_category,
+        )
+        self.attn_impl_cls = attn_backend_cls.get_impl_cls()
+        self.attention = self.attn_impl_cls(..., backend_kwargs=spec.backend_kwargs() if spec else None)
 ```
 
 **Available Backends**:
 
-- **FlashAttention**: Optimized CUDA kernel (FA2/FA3) - memory efficient via tiling
+- **FlashAttention** (`FLASH_ATTN`): Memory-efficient kernel that dispatches to FA2/FA3 on CUDA, AITER on ROCm, and `mindiesd` on Ascend NPU.
 
-- **SDPA**: PyTorch's scaled dot-product attention - default, cross-platform
+- **SDPA** (`TORCH_SDPA`): PyTorch's scaled dot-product attention — cross-platform fallback.
 
-- **SageAttention**: Sparse attention implementation from SageAttention library
-
-- **AscendAttention**: NPU-optimized attention for Ascend hardware
+- **SageAttention** (`SAGE_ATTN`): Quantized attention implementation from the SageAttention library.
 
 These backends provide the **kernel implementations** for attention computation. For attention-level sequence parallelism strategies (Ring Attention, Ulysses), see [Parallel Attention](#52-parallel-attention).
 
 #### Backend Selection Mechanism
 
+Selection is driven by `OmniDiffusionConfig.diffusion_attention_config`, which carries a global `default` plus a `per_role` map of `AttentionSpec` entries. A role string is resolved in this order:
+
 ```python
-def get_attn_backend(head_size: int) -> type[AttentionBackend]:
-    # Check environment variable
-    backend_name = os.environ.get("DIFFUSION_ATTENTION_BACKEND")
-
-    if backend_name:
-        return load_backend(backend_name.upper())
-
-    # Default to SDPA
-    return SDPABackend
+def get_attn_backend_for_role(role, head_size, attention_config=None, role_category=None):
+    # 1. attention_config.per_role[role]            — exact match
+    # 2. attention_config.per_role[role_category]   — category fallback
+    # 3. attention_config.default                   — global default
+    # 4. Platform default                           — hardware-specific
+    if attention_config is not None:
+        spec, source = attention_config.resolve_with_source(
+            role=role, role_category=role_category,
+        )
+        if spec is not None:
+            return load_backend(spec.backend), spec
+    return current_omni_platform.get_diffusion_attn_backend_cls(...), None
 ```
 
 **Selection Priority**:
 
-1. **Environment Variable**: `DIFFUSION_ATTENTION_BACKEND` for manual override
+1. **Per-role override** (`--diffusion-attention-config.per_role.<role>.backend`) — finest control; matched on the layer's exact `role` string.
 
-    - Valid values: `FLASH_ATTN`, `TORCH_SDPA`, `SAGE_ATTN`, `ASCEND`
+2. **Role category fallback** (`--diffusion-attention-config.per_role.<category>.backend`) — used when an exact match is missing and the layer declared `role_category` (e.g. a `"mymodel.audio_to_video"` site can fall back to `"cross"`).
 
-    - Example: `export DIFFUSION_ATTENTION_BACKEND=SAGE_ATTN`
+3. **Global default** (`--diffusion-attention-backend FLASH_ATTN`, or `--diffusion-attention-config.default.backend`, or `DIFFUSION_ATTENTION_BACKEND` env var).
 
-2. **Automatic Fallback**: Falls back to SDPA if selected backend unavailable
+4. **Platform default** — `current_omni_platform.get_diffusion_attn_backend_cls(...)` picks the best-available kernel for the hardware.
 
-3. **Hardware Detection**: Can select based on device type (NPU, CUDA, etc.)
+A backend that needs configuration exposes it as a typed field on `AttentionSpec`; `AttentionSpec.backend_kwargs()` serializes it into the `backend_kwargs` the impl consumes. Today those fields are `skip_softmax` (TRTLLM_ATTN) and `block_sparse` (any block-sparse backend, currently RAINFUSION_ATTN), so e.g. `target_sparsity` or `sparsity` can be set without changing model code.
+
+For the user-facing CLI surface, see [Diffusion Attention Backends](../../user_guide/diffusion/attention_backends.md). For the role declaration contract on the model side, see [Adding a Diffusion Model](../../contributing/model/adding_diffusion_model.md).
 
 **Backend Availability**:
 
 - **SDPA**: Always available (PyTorch built-in)
 
-- **FlashAttention**: Requires `flash-attn` package installed
+- **FlashAttention**: Requires `flash-attn` on CUDA, `aiter` on ROCm, or `mindiesd` on Ascend NPU
 
 - **SageAttention**: Requires `sage-attention` package (from THU-ML GitHub)
 
-- **AscendAttention**: Only available on Ascend NPU hardware
-
 #### Attention Backend Registry
 
-**Location**: `vllm_omni/diffusion/attention/selector.py`
+**Location**: `vllm_omni/diffusion/attention/selector.py` + `vllm_omni/platforms/<device>/platform.py`
 
-The attention system uses a **registry pattern** to manage and dynamically load attention backends. This allows for easy extension and runtime selection of backends.
-
-
-**Registry Structure**:
+Backend resolution is delegated to the active platform: `current_omni_platform.get_diffusion_attn_backend_cls(selected_backend, head_size)` returns a fully-qualified class path that `_load_backend_cls` imports lazily, with the result cached by `(backend_name, head_size)`.
 
 ```python
-# Registry mapping backend names to their module paths and class names
-_BACKEND_CONFIG = {
-    "FLASH_ATTN": {
-        "module": "vllm_omni.diffusion.attention.backends.flash_attn",
-        "class": "FlashAttentionBackend",
-    },
-    "TORCH_SDPA": {
-        "module": "vllm_omni.diffusion.attention.backends.sdpa",
-        "class": "SDPABackend",
-    },
-    "SAGE_ATTN": {
-        "module": "vllm_omni.diffusion.attention.backends.sage_attn",
-        "class": "SageAttentionBackend",
-    },
-    "ASCEND": {
-        "module": "vllm_omni.diffusion.attention.backends.ascend_attn",
-        "class": "AscendAttentionBackend",
-    },
-}
+@cache
+def _cached_get_backend_cls(backend_name: str | None, head_size: int) -> type[AttentionBackend]:
+    backend_cls_path = current_omni_platform.get_diffusion_attn_backend_cls(
+        selected_backend=backend_name,
+        head_size=head_size,
+    )
+    return _load_backend_cls(backend_cls_path)
 ```
+
+Each platform (`cuda`, `rocm`, `xpu`, `musa`, `npu`) maps backend names like `"FLASH_ATTN"`, `"TORCH_SDPA"`, `"SAGE_ATTN"` to the right backend class path for that hardware, including head-size compatibility checks. Passing `selected_backend=None` lets the platform pick its own default.
 
 #### Attention Backend Integration
 
@@ -748,7 +768,7 @@ class TeaCacheBackend(CacheBackend):
 
 **2. Cache-DiT Backend**
 
-**Location**: `vllm_omni/diffusion/cache/cache_dit_backend.py`
+**Location**: `vllm_omni/diffusion/cache/cachedit/`
 
 ```python
 class CacheDiTBackend(CacheBackend):
@@ -908,38 +928,51 @@ def initialize_model_parallel(
 
 ```
 1. User Request
-   └─> OmniDiffusion.generate(prompt)
+   └─> Omni.generate(prompt)
        └─> Prepare OmniDiffusionRequest
-           └─> DiffusionEngine.step(requests)
+           └─> DiffusionEngine.step_streaming(request)
 
 2. Pre-processing
-   └─> pre_process_func(requests)
+   └─> pre_process_func(request)
        └─> Model-specific transformations
 
 3. Scheduling
-   └─> scheduler.add_request(request)
-       └─> scheduler.schedule()
-           └─> DiffusionEngine submits scheduled request to executor.add_req(req)
+       └─> scheduler.add_request(request)
+           └─> scheduler.schedule()
+           └─> DiffusionEngine selects execute_batch / execute_step
 
 4. Worker Execution
-   └─> WorkerProc.worker_busy_loop()
-       └─> GPUWorker.execute_model(reqs)
-           └─> Pipeline.forward(req)
-               ├─> encode_prompt()
-               ├─> prepare_latents()
-               ├─> diffuse() [loop]
-               │   ├─> transformer.forward() [with cache backend hooks]
-               │   └─> scheduler.step()
-               └─> vae.decode()
+   └─> WorkerProc._worker_busy_loop()
+       └─> DiffusionWorker.execute_model(req)
+           └─> DiffusionModelRunner selects execution mode
+               ├─> REQUEST_BATCH
+               │   └─> Pipeline.forward(req_or_batch)
+               │       ├─> encode_prompt()
+               │       ├─> prepare_latents()
+               │       ├─> diffuse() [loop]
+               │       │   ├─> transformer.forward() [with cache backend hooks]
+               │       │   └─> scheduler.step()
+               │       └─> vae.decode()
+               └─> STEP
+                   ├─> pipeline.prepare_encode(state) [new requests]
+                   ├─> pipeline.denoise_step(input_batch)
+                   ├─> pipeline.step_scheduler(state, noise_pred)
+                   └─> pipeline.post_decode(state) [chunk boundary or final step]
 
 5. Result Collection
-   └─> Executor returns DiffusionOutput
+   └─> Executor returns RunnerOutput / BatchRunnerOutput
        └─> scheduler.update_from_output(...)
-           └─> DiffusionEngine pops finished request state
+           ├─> DiffusionEngine emits chunk/final output to request queue
+           └─> DiffusionEngine finalizes terminal scheduler state
 
 6. Post-processing
    └─> post_process_func(output)
        └─> Convert to PIL images / final format
+
+7. Stream Completion / Cancellation
+   ├─> Streaming callers receive every yielded output
+   ├─> Non-streaming callers drain the stream and return the final output
+   └─> Cancelled streams drop their output queue but still allow scheduler state cleanup
 ```
 
 ---

@@ -3,14 +3,18 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
+from typing import cast
 from uuid import uuid4
 
 import numpy as np
 from vllm.entrypoints.openai.engine.protocol import UsageInfo
-from vllm.entrypoints.openai.realtime.connection import RealtimeConnection as VllmRealtimeConnection
-from vllm.entrypoints.openai.realtime.protocol import TranscriptionDelta, TranscriptionDone
+from vllm.entrypoints.speech_to_text.realtime.connection import RealtimeConnection as VllmRealtimeConnection
+from vllm.entrypoints.speech_to_text.realtime.protocol import TranscriptionDelta, TranscriptionDone
 from vllm.logger import init_logger
+
+from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.utils import coerce_param_message_types
 
 logger = init_logger(__name__)
 
@@ -24,8 +28,7 @@ class RealtimeConnection(VllmRealtimeConnection):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Last audio buffer seen for this realtime generation (cumulative or concatenation
-        # of increments); used to turn server cumulative PCM into true deltas.
+        self.engine = cast(AsyncOmni, self.serving.engine_client)
         self._realtime_audio_ref: np.ndarray | None = None
 
     async def start_generation(self):
@@ -79,13 +82,21 @@ class RealtimeConnection(VllmRealtimeConnection):
 
     def _extract_audio_chunks(self, output) -> tuple[list[np.ndarray], int]:
         mm = getattr(output, "multimodal_output", None)
-        if not isinstance(mm, dict):
+        if mm is None:
+            return [], 24000
+        # Support both MultimodalPayload and plain dict
+        if not isinstance(mm, Mapping):
             return [], 24000
 
         sr = mm.get("sr") or mm.get("sample_rate") or mm.get("audio_sample_rate") or 24000
+        if isinstance(sr, (list, tuple)) and sr:
+            sr = sr[-1]
+        if hasattr(sr, "item"):
+            sr = sr.item()
+        sample_rate_hz = int(sr)
         key = "audio" if "audio" in mm else ("model_outputs" if "model_outputs" in mm else None)
         if key is None:
-            return [], int(sr)
+            return [], sample_rate_hz
 
         raw_audio = mm.get(key)
         chunks: list[np.ndarray] = []
@@ -98,7 +109,7 @@ class RealtimeConnection(VllmRealtimeConnection):
             arr = self._tensor_to_numpy(raw_audio)
             if arr is not None and arr.size > 0:
                 chunks.extend(self._raw_waveform_to_deltas(arr))
-        return chunks, int(sr)
+        return chunks, sample_rate_hz
 
     @staticmethod
     def _pcm16_b64(audio_f32: np.ndarray) -> str:
@@ -115,37 +126,43 @@ class RealtimeConnection(VllmRealtimeConnection):
         sent_audio = False
         audio_done_sent = False
         full_text = ""
-        sent_text_len = 0
         prompt_token_ids_len = 0
         completion_tokens_len = 0
         self._realtime_audio_ref = None
 
+        # Coerce cumulative outputs to delta outputs; this ensures
+        # we don't emit redundant MM data & drain after emitting.
+        sampling_params_list = list(self.engine.default_sampling_params_list)
+        sampling_params_list = coerce_param_message_types(
+            sampling_params_list,
+            is_streaming=True,
+        )
+
+        result_gen = None
         try:
-            result_gen = self.serving.engine_client.generate(
+            result_gen = self.engine.generate(
                 prompt=streaming_input_gen,
                 request_id=request_id,
+                sampling_params_list=sampling_params_list,
             )
 
             async for output in result_gen:
-                if output.outputs and len(output.outputs) > 0:
-                    output0 = output.outputs[0]
-                    token_ids = list(output0.token_ids)
-                    if token_ids:
-                        input_stream.put_nowait(token_ids)
-                        # token_ids are cumulative per request
-                        completion_tokens_len = len(token_ids)
-                    if not prompt_token_ids_len and output.prompt_token_ids:
-                        prompt_token_ids_len = len(output.prompt_token_ids)
-                    cumulative_text = output0.text or ""
-                    if cumulative_text:
-                        if len(cumulative_text) >= sent_text_len:
-                            delta_text = cumulative_text[sent_text_len:]
-                        else:
-                            delta_text = cumulative_text
-                        sent_text_len = len(cumulative_text)
-                        full_text = cumulative_text
-                    else:
-                        delta_text = ""
+                stage_id = getattr(output, "stage_id", None)
+                if stage_id == 0 and output.outputs:
+                    first_output = output.outputs[0]
+                    new_token_ids = list(first_output.token_ids)
+                    if new_token_ids:
+                        input_stream.put_nowait(new_token_ids)
+
+                    if output.prompt_token_ids:
+                        prompt_token_ids_len = max(
+                            prompt_token_ids_len,
+                            len(output.prompt_token_ids),
+                        )
+
+                    delta_text = first_output.text or ""
+                    full_text += delta_text
+                    completion_tokens_len += len(new_token_ids)
 
                     if delta_text:
                         await self.send(TranscriptionDelta(delta=delta_text))
@@ -180,6 +197,16 @@ class RealtimeConnection(VllmRealtimeConnection):
             logger.exception("Error in generation: %s", e)
             await self.send_error(str(e), "processing_error")
         finally:
+            # Close the generator explicitly so AsyncOmni.generate's cleanup
+            # (input-pump cancellation and engine-side abort) runs now rather
+            # than whenever the event loop garbage-collects the async
+            # generator; the delay window is where a disconnected session
+            # keeps cycling through the stages (issue #4271).
+            if result_gen is not None:
+                try:
+                    await result_gen.aclose()
+                except Exception:
+                    logger.exception("Failed to close realtime result generator")
             # Always send terminal event so clients don't hang forever.
             if self._is_connected and not audio_done_sent:
                 try:
@@ -190,4 +217,10 @@ class RealtimeConnection(VllmRealtimeConnection):
                 self.audio_queue.get_nowait()
 
     async def send_json(self, payload: dict):
-        await self.websocket.send_text(json.dumps(payload))
+        try:
+            await self.websocket.send_text(json.dumps(payload))
+        except Exception:
+            # A failed send means the client is gone; flag it so the
+            # generation loop stops instead of retrying into a dead socket.
+            self._is_connected = False
+            raise

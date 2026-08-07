@@ -5,6 +5,7 @@ This example shows how to use vLLM-Omni for running offline inference
 with the correct prompt format on Qwen2.5-Omni
 """
 
+import json
 import os
 import time
 from typing import NamedTuple
@@ -18,9 +19,9 @@ from vllm.assets.video import VideoAsset, video_to_ndarrays
 from vllm.multimodal.image import convert_image_mode
 from vllm.multimodal.media.audio import load_audio
 from vllm.sampling_params import SamplingParams
-from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 SEED = 42
 
@@ -289,7 +290,10 @@ query_map = {
 
 
 def main(args):
-    model_name = "Qwen/Qwen2.5-Omni-7B"
+    model_name = args.model
+    quantization_config = None
+    if args.quantization_config is not None:
+        quantization_config = json.loads(args.quantization_config)
 
     # Get paths from args
     video_path = getattr(args, "video_path", None)
@@ -320,7 +324,11 @@ def main(args):
         query_result = query_func(audio_path=audio_path, sampling_rate=sampling_rate)
     else:
         query_result = query_func()
-    omni = Omni.from_cli_args(args, model=model_name)
+    args.quantization_config = quantization_config
+    omni_kwargs = vars(args).copy()
+    # Override CLI --model with the derived model_name.
+    omni_kwargs["model"] = model_name
+    omni = Omni(**omni_kwargs)
     thinker_sampling_params = SamplingParams(
         temperature=0.0,  # Deterministic - no randomness
         top_p=1.0,  # Disable nucleus sampling
@@ -423,7 +431,19 @@ def main(args):
 
 
 def parse_args():
-    parser = FlexibleArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
+    parser = TrackingArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="Qwen/Qwen2.5-Omni-7B",
+        help="Model name or local path.",
+    )
+    parser.add_argument(
+        "--quantization-config",
+        type=str,
+        default=None,
+        help="Optional JSON string forwarded to Omni(quantization_config=...).",
+    )
     parser.add_argument(
         "--query-type",
         "-q",
@@ -532,6 +552,39 @@ def parse_args():
         action="store_true",
         default=False,
         help="Use py_generator mode. The returned type of Omni.generate() is a Python Generator object.",
+    )
+    parser.add_argument(
+        "--deploy-config",
+        type=str,
+        default=None,
+        help="Optional explicit deploy YAML (otherwise the bundled default is used).",
+    )
+    parser.add_argument(
+        "--strategy-config",
+        type=str,
+        default=None,
+        help=(
+            "Optional composable-parallel strategy.yaml mapping role -> parallel axes "
+            "(e.g. tp / stage_replica). Overlaid onto the merged stage configs."
+        ),
+    )
+    parser.add_argument(
+        "--stage-overrides",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSON of per-stage overrides applied on top of the default "
+            'deploy config, e.g. \'{"0": {"devices": "0,1"}}\' to give the '
+            "thinker a 2-GPU pool. Lets you run a strategy on the bundled default "
+            "deploy config without writing a bespoke deploy YAML."
+        ),
+    )
+    parser.add_argument(
+        "--omni-lb-policy",
+        type=str,
+        default=None,
+        choices=["random", "round-robin", "least-queue-length"],
+        help="StagePool load-balancer policy for replicated stages (orchestrator-level knob).",
     )
     return parser.parse_args()
 
